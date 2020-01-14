@@ -12,9 +12,15 @@
 
 use sandbox::Command;
 
+use libc::dup2;
+use libc::pipe;
+use libc::{self, c_char, c_int};
 use libc::{execve, fork, pid_t, waitpid, WEXITSTATUS, WIFEXITED, WTERMSIG};
+use libc::{STDIN_FILENO, STDOUT_FILENO};
 use std::ffi::CString;
+use std::fs::File;
 use std::io;
+use std::os::unix::io::FromRawFd;
 use std::ptr;
 use std::str;
 
@@ -35,7 +41,8 @@ pub fn exec(command: &Command) -> io::Error {
                 str::from_utf8(value.to_bytes()).unwrap()
             );
             CString::new(entry).unwrap()
-        }).collect();
+        })
+        .collect();
     let mut env: Vec<_> = env.iter().map(|entry| entry.as_ptr()).collect();
     env.push(ptr::null());
 
@@ -47,13 +54,41 @@ pub fn exec(command: &Command) -> io::Error {
 }
 
 pub fn spawn(command: &Command) -> io::Result<Process> {
+    let mut fd1 = [0 as c_int; 2];
+    let mut fd2 = [0 as c_int; 2];
+
+    if unsafe { pipe(&mut fd1[0]) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { pipe(&mut fd2[0]) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
     unsafe {
         match fork() {
             0 => {
+                libc::close(fd1[1]);
+                libc::close(fd2[0]);
+
+                assert_eq!(dup2(fd1[0], STDIN_FILENO), STDIN_FILENO);
+                libc::close(fd1[0]);
+
+                assert_eq!(dup2(fd2[1], STDOUT_FILENO), STDOUT_FILENO);
+                libc::close(fd2[1]);
+
                 drop(exec(command));
                 panic!()
             }
-            pid => Ok(Process { pid: pid }),
+            pid => {
+                libc::close(fd1[0]);
+                libc::close(fd2[1]);
+
+                Ok(Process {
+                    pid,
+                    stdin: File::from_raw_fd(fd1[1]),
+                    stdout: File::from_raw_fd(fd2[0]),
+                })
+            }
         }
     }
 }
@@ -61,6 +96,8 @@ pub fn spawn(command: &Command) -> io::Result<Process> {
 #[allow(missing_copy_implementations)]
 pub struct Process {
     pub pid: pid_t,
+    pub stdin: File,
+    pub stdout: File,
 }
 
 impl Process {

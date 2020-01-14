@@ -11,27 +11,27 @@
 //! Sandboxing on Linux via namespaces.
 
 use platform::linux::seccomp;
-use platform::unix::process::Process;
 use platform::unix;
+use platform::unix::process::Process;
 use profile::{Operation, PathPattern, Profile};
 use sandbox::Command;
 
-use libc::{self, c_char, c_int, c_ulong, c_void, gid_t, pid_t, size_t, ssize_t, uid_t};
 use libc::dup2;
-use libc::{STDIN_FILENO, STDOUT_FILENO};
+use libc::{self, c_char, c_int, c_ulong, c_void, gid_t, pid_t, size_t, ssize_t, uid_t};
+use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 use std::env;
 use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::iter;
 use std::mem;
+use std::os::unix::io::FromRawFd;
 use std::os::unix::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::os::unix::io::FromRawFd;
 
 /// Creates a namespace and sets up a chroot jail.
-pub fn activate(profile: &Profile) -> Result<(),c_int> {
+pub fn activate(profile: &Profile) -> Result<(), c_int> {
     let jail = try!(ChrootJail::new(profile));
     try!(jail.enter());
     drop_capabilities()
@@ -44,12 +44,12 @@ struct ChrootJail {
 
 impl ChrootJail {
     /// Creates a new `chroot` jail.
-    fn new(profile: &Profile) -> Result<ChrootJail,c_int> {
+    fn new(profile: &Profile) -> Result<ChrootJail, c_int> {
         let prefix = CString::new("/tmp/gaol.XXXXXX").unwrap();
         let mut prefix: Vec<u8> = prefix.as_bytes_with_nul().iter().map(|x| *x).collect();
         unsafe {
             if libc::mkdtemp(prefix.as_mut_ptr() as *mut c_char).is_null() {
-                return Err(-1)
+                return Err(-1);
             }
         }
         let jail_dir = PathBuf::from(OsStr::from_bytes(&prefix[..prefix.len() - 1]));
@@ -57,27 +57,25 @@ impl ChrootJail {
             directory: jail_dir,
         };
 
-        let dest = CString::new(jail.directory
-                                    .as_os_str()
-                                    .to_str()
-                                    .unwrap()
-                                    .as_bytes()).unwrap();
+        let dest = CString::new(jail.directory.as_os_str().to_str().unwrap().as_bytes()).unwrap();
         let tmpfs = CString::new("tmpfs").unwrap();
         let result = unsafe {
-            libc::mount(tmpfs.as_ptr(),
-                        dest.as_ptr(),
-                        tmpfs.as_ptr(),
-                        libc::MS_NOATIME | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_NOSUID,
-                        ptr::null())
+            libc::mount(
+                tmpfs.as_ptr(),
+                dest.as_ptr(),
+                tmpfs.as_ptr(),
+                libc::MS_NOATIME | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_NOSUID,
+                ptr::null(),
+            )
         };
         if result != 0 {
-            return Err(result)
+            return Err(result);
         }
 
         for operation in profile.allowed_operations().iter() {
             match *operation {
-                Operation::FileReadAll(PathPattern::Literal(ref path)) |
-                Operation::FileReadAll(PathPattern::Subpath(ref path)) => {
+                Operation::FileReadAll(PathPattern::Literal(ref path))
+                | Operation::FileReadAll(PathPattern::Subpath(ref path)) => {
                     try!(jail.bind_mount(path));
                 }
                 _ => {}
@@ -88,17 +86,12 @@ impl ChrootJail {
     }
 
     /// Enters the `chroot` jail.
-    fn enter(&self) -> Result<(),c_int> {
-        let directory = CString::new(self.directory
-                                         .as_os_str()
-                                         .to_str()
-                                         .unwrap()
-                                         .as_bytes()).unwrap();
-        let result = unsafe {
-            libc::chroot(directory.as_ptr())
-        };
+    fn enter(&self) -> Result<(), c_int> {
+        let directory =
+            CString::new(self.directory.as_os_str().to_str().unwrap().as_bytes()).unwrap();
+        let result = unsafe { libc::chroot(directory.as_ptr()) };
         if result != 0 {
-            return Err(result)
+            return Err(result);
         }
 
         match env::set_current_dir(&Path::new(".")) {
@@ -108,18 +101,19 @@ impl ChrootJail {
     }
 
     /// Bind mounts a path into our chroot jail.
-    fn bind_mount(&self, source_path: &Path) -> Result<(),c_int> {
+    fn bind_mount(&self, source_path: &Path) -> Result<(), c_int> {
         // Create all intermediate directories.
         let mut destination_path = self.directory.clone();
-        let mut components: Vec<OsString> =
-            source_path.components().skip(1)
-                                    .map(|component| component.as_os_str().to_os_string())
-                                    .collect();
+        let mut components: Vec<OsString> = source_path
+            .components()
+            .skip(1)
+            .map(|component| component.as_os_str().to_os_string())
+            .collect();
         let last_component = components.pop();
         for component in components.into_iter() {
             destination_path.push(component);
             if fs::create_dir(&destination_path).is_err() {
-                return Err(-1)
+                return Err(-1);
             }
         }
 
@@ -129,37 +123,35 @@ impl ChrootJail {
             match fs::metadata(source_path) {
                 Ok(ref metadata) if metadata.is_dir() => {
                     if fs::create_dir(&destination_path).is_err() {
-                        return Err(-1)
+                        return Err(-1);
                     }
                 }
                 Ok(_) => {
                     if File::create(&destination_path).is_err() {
-                        return Err(-1)
+                        return Err(-1);
                     }
                 }
                 Err(_) => {
                     // The source directory didn't exist. Just don't create the bind mount.
-                    return Ok(())
+                    return Ok(());
                 }
             }
         }
 
         // Create the bind mount.
-        let source_path = CString::new(source_path.as_os_str()
-                                                  .to_str()
-                                                  .unwrap()
-                                                  .as_bytes()).unwrap();
-        let destination_path = CString::new(destination_path.as_os_str()
-                                                            .to_str()
-                                                            .unwrap()
-                                                            .as_bytes()).unwrap();
+        let source_path =
+            CString::new(source_path.as_os_str().to_str().unwrap().as_bytes()).unwrap();
+        let destination_path =
+            CString::new(destination_path.as_os_str().to_str().unwrap().as_bytes()).unwrap();
         let bind = CString::new("bind").unwrap();
         let result = unsafe {
-            libc::mount(source_path.as_ptr(),
-                  destination_path.as_ptr(),
-                  bind.as_ptr(),
-                  libc::MS_MGC_VAL | libc::MS_BIND | libc::MS_REC,
-                  ptr::null_mut())
+            libc::mount(
+                source_path.as_ptr(),
+                destination_path.as_ptr(),
+                bind.as_ptr(),
+                libc::MS_MGC_VAL | libc::MS_BIND | libc::MS_REC,
+                ptr::null_mut(),
+            )
         };
         if result == 0 {
             Ok(())
@@ -171,17 +163,22 @@ impl ChrootJail {
 
 /// Removes fake-superuser capabilities. This removes our ability to mess with the filesystem view
 /// we've set up.
-fn drop_capabilities() -> Result<(),c_int> {
+fn drop_capabilities() -> Result<(), c_int> {
     let capability_data: Vec<_> = iter::repeat(__user_cap_data_struct {
         effective: 0,
         permitted: 0,
         inheritable: 0,
-    }).take(_LINUX_CAPABILITY_U32S_3 as usize).collect();
+    })
+    .take(_LINUX_CAPABILITY_U32S_3 as usize)
+    .collect();
     let result = unsafe {
-        capset(&__user_cap_header_struct {
-            version: _LINUX_CAPABILITY_VERSION_3,
-            pid: 0,
-        }, capability_data.as_ptr())
+        capset(
+            &__user_cap_header_struct {
+                version: _LINUX_CAPABILITY_VERSION_3,
+                pid: 0,
+            },
+            capability_data.as_ptr(),
+        )
     };
     if result == 0 {
         Ok(())
@@ -211,19 +208,19 @@ unsafe fn prepare_user_and_pid_namespaces(parent_uid: uid_t, parent_gid: gid_t) 
 pub fn start(profile: &Profile, command: &mut Command) -> io::Result<Process> {
     // Store our root namespace UID and GID because they're going to change once we enter a user
     // namespace.
-    let (parent_uid, parent_gid) = unsafe {
-        (libc::getuid(), libc::getgid())
-    };
+    let (parent_uid, parent_gid) = unsafe { (libc::getuid(), libc::getgid()) };
 
     // Always create an IPC namespace, a mount namespace, and a UTS namespace. Additionally, if we
     // aren't allowing network operations, create a network namespace.
     let mut unshare_flags = libc::CLONE_NEWIPC | libc::CLONE_NEWNS | libc::CLONE_NEWUTS;
-    if !profile.allowed_operations().iter().any(|operation| {
-        match *operation {
+    if !profile
+        .allowed_operations()
+        .iter()
+        .any(|operation| match *operation {
             Operation::NetworkOutbound(_) => true,
             _ => false,
-        }
-    }) {
+        })
+    {
         unshare_flags |= libc::CLONE_NEWNET
     }
 
@@ -235,8 +232,10 @@ pub fn start(profile: &Profile, command: &mut Command) -> io::Result<Process> {
         // Create two other pipes for stdin and stdout
         let mut io1_fds = [0, 0];
         let mut io2_fds = [0, 0];
+        let mut io3_fds = [0, 0];
         assert_eq!(libc::pipe(&mut io1_fds[0]), 0);
         assert_eq!(libc::pipe(&mut io2_fds[0]), 0);
+        assert_eq!(libc::pipe(&mut io3_fds[0]), 0);
 
         // Set this `prctl` flag so that we can wait on our grandchild. (Otherwise it'll be
         // reparented to init.)
@@ -259,6 +258,7 @@ pub fn start(profile: &Profile, command: &mut Command) -> io::Result<Process> {
 
                     assert_eq!(libc::close(io1_fds[1]), 0);
                     assert_eq!(libc::close(io2_fds[0]), 0);
+                    assert_eq!(libc::close(io3_fds[0]), 0);
 
                     assert_eq!(dup2(io1_fds[0], STDIN_FILENO), STDIN_FILENO);
                     assert_eq!(libc::close(io1_fds[0]), 0);
@@ -266,16 +266,22 @@ pub fn start(profile: &Profile, command: &mut Command) -> io::Result<Process> {
                     assert_eq!(dup2(io2_fds[1], STDOUT_FILENO), STDOUT_FILENO);
                     assert_eq!(libc::close(io2_fds[1]), 0);
 
+                    assert_eq!(dup2(io3_fds[1], STDERR_FILENO), STDERR_FILENO);
+                    assert_eq!(libc::close(io3_fds[1]), 0);
+
                     // Go ahead and start the command.
                     drop(unix::process::exec(command));
                     libc::abort()
                 }
                 grandchild_pid => {
                     // Send the PID of our child up to our parent and exit.
-                    assert!(libc::write(pipe_fds[1],
-                                        &grandchild_pid as *const pid_t as *const c_void,
-                                        mem::size_of::<pid_t>() as size_t) ==
-                                            mem::size_of::<pid_t>() as ssize_t);
+                    assert!(
+                        libc::write(
+                            pipe_fds[1],
+                            &grandchild_pid as *const pid_t as *const c_void,
+                            mem::size_of::<pid_t>() as size_t
+                        ) == mem::size_of::<pid_t>() as ssize_t
+                    );
                     libc::exit(0);
                 }
             }
@@ -286,17 +292,22 @@ pub fn start(profile: &Profile, command: &mut Command) -> io::Result<Process> {
 
         libc::close(io1_fds[0]);
         libc::close(io2_fds[1]);
+        libc::close(io3_fds[1]);
 
         // Retrieve our grandchild's PID.
         let mut grandchild_pid: pid_t = 0;
-        assert!(libc::read(pipe_fds[0],
-                           &mut grandchild_pid as *mut i32 as *mut c_void,
-                           mem::size_of::<pid_t>() as size_t) ==
-                mem::size_of::<pid_t>() as ssize_t);
+        assert!(
+            libc::read(
+                pipe_fds[0],
+                &mut grandchild_pid as *mut i32 as *mut c_void,
+                mem::size_of::<pid_t>() as size_t
+            ) == mem::size_of::<pid_t>() as ssize_t
+        );
         Ok(Process {
             pid: grandchild_pid,
             stdin: File::from_raw_fd(io1_fds[1]),
             stdout: File::from_raw_fd(io2_fds[0]),
+            stderr: File::from_raw_fd(io3_fds[0]),
         })
     }
 }
@@ -324,6 +335,6 @@ type const_cap_user_data_t = *const __user_cap_data_struct;
 
 const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 const _LINUX_CAPABILITY_U32S_3: u32 = 2;
-extern {
+extern "C" {
     fn capset(hdrp: cap_user_header_t, datap: const_cap_user_data_t) -> c_int;
 }
